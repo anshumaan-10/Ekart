@@ -1,0 +1,120 @@
+
+pipeline {
+    agent any
+    tools {
+        maven 'maven3'
+        jdk 'jdk17'
+    }
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+    }
+
+    stages {
+        stage('Git Checkout') {
+            steps {
+                echo "Starting the checkout stage"
+                git branch: 'main', url: 'https://github.com/anshumaan-10/Ekart.git'
+            }
+        }
+        stage('Compile') {
+            steps {
+                sh "mvn compile"
+            }
+        }
+        stage('Unit Test Case') {
+            steps {
+                sh "mvn test -DskipTests=true"
+            }
+        }
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar') {
+                    sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectKey=EKART \
+                        -Dsonar.projectName=EKART \
+                        -Dsonar.java.binaries=.
+                    '''
+                }
+            }
+        }
+        stage('OWASP Dependency Check') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./', odcInstallation: 'DC'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
+        stage('Package') {
+            steps {
+                sh "mvn package -DskipTests=true"
+            }
+        }
+        stage('Deploy To Nexus') {
+            steps {
+                withMaven(globalMavenSettingsConfig: 'global-maven', jdk: 'jdk17', maven: 'maven3', mavenSettingsConfig: '', traceability: true) {
+                    sh "mvn deploy -DskipTests=true"
+                }
+            }
+        }
+        stage('Build and Tag Docker Image') {
+            steps {
+                script {
+                    docker.withRegistry('', 'docker-cred') {
+                        sh "docker build -t anshumaan10/ekart:latest -f docker/Dockerfile ."
+                    }
+                }
+            }
+        }
+        stage('Trivy Image Scan') {
+            steps {
+                sh "trivy image anshumaan10/ekart:latest > trivy-report.txt"
+            }
+        }
+        stage('Push Docker Image') {
+            steps {
+                script {
+                    docker.withRegistry('', 'docker-cred') {
+                        sh "docker push anshumaan10/ekart:latest"
+                    }
+                }
+            }
+        }
+        stage('Kubernetes Deploy') {
+            steps {
+                withKubeConfig(credentialsId: 'k8-token', serverUrl: 'https://172.31.30.112:6443', contextName: '', namespace: 'webapps', caCertificate: '', clusterName: '', restrictKubeConfigAccess: false) {
+                    sh "kubectl apply -f deploymentservice.yml -n webapps"
+                    sh "kubectl get svc -n webapps"
+                }
+            }
+        }
+        stage("Docker Pull Dastardly from Burp Suite container image") {
+            steps {
+                sh 'docker pull public.ecr.aws/portswigger/dastardly:latest'
+            }
+        }
+        stage("Docker run Dastardly from Burp Suite Scan") {
+            steps {
+                cleanWs()
+                sh '''
+                    docker run --user $(id -u) -v ${WORKSPACE}:${WORKSPACE}:rw \
+                    -e BURP_START_URL=http://3.17.12.217:30639 \
+                    -e BURP_REPORT_FILE_PATH=${WORKSPACE}/dastardly-report.xml \
+                    -e BURP_USER=admin \
+                    -e BURP_PASS=admin \
+                    public.ecr.aws/portswigger/dastardly:latest || true
+                '''
+            }
+        }
+        stage("Additional URL") {
+            steps {
+                sh 'curl -X GET http://3.17.12.217:30639/login || true'
+            }
+        }
+    }
+    post {
+        always {
+            // Publish JUnit report; this is not dependent on the success of the previous stages
+            junit testResults: 'dastardly-report.xml', skipPublishingChecks: true
+        }
+    }
+}
